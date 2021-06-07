@@ -52,6 +52,10 @@ import org.openstreetmap.josm.gui.MapFrame;
 import org.openstreetmap.josm.gui.MapView;
 import org.openstreetmap.josm.gui.Notification;
 import org.openstreetmap.josm.gui.layer.Layer;
+import org.openstreetmap.josm.gui.tagging.presets.TaggingPreset;
+import org.openstreetmap.josm.gui.tagging.presets.TaggingPresetSearchDialog;
+import org.openstreetmap.josm.gui.tagging.presets.TaggingPresetType;
+import org.openstreetmap.josm.gui.tagging.presets.TaggingPresets;
 import org.openstreetmap.josm.plugins.austriaaddresshelper.AustriaAddressHelperAction;
 import org.openstreetmap.josm.tools.ImageProvider;
 import org.openstreetmap.josm.tools.Shortcut;
@@ -68,14 +72,19 @@ public class AreaSelectorAction extends MapMode implements MouseListener {
             toleranceAngle = ImageAnalyzer.DEFAULT_TOLERANCEANGLE;
 
     protected boolean showAddressDialog = true, mergeNodes = true, useAustriaAdressHelper = false,
-            replaceBuildings = true, addSourceTag = false;
+            replaceBuildings = true, addSourceTag = false, applyPresetDirectly = false;
+    protected String taggingStyle = "none";
+    protected String taggingPresetName = "";
 
     public static final String PLUGIN_NAME = "areaselector";
 
     public static final String KEY_SHOWADDRESSDIALOG = PLUGIN_NAME + ".showaddressdialog",
+            KEY_TAGGINGSTYLE = PLUGIN_NAME + ".taggingstyle",
+            KEY_TAGGINGPRESETNAME = PLUGIN_NAME + ".taggingpresetname",
             KEY_MERGENODES = PLUGIN_NAME + ".mergenodes", KEY_AAH = PLUGIN_NAME + ".austriaadresshelper",
             KEY_REPLACEBUILDINGS = PLUGIN_NAME + ".replacebuildings",
-            KEY_ADDSOURCETAG = PLUGIN_NAME + ".addsourcetag";
+            KEY_ADDSOURCETAG = PLUGIN_NAME + ".addsourcetag",
+            KEY_APPLYPRESETDIRECTLY = PLUGIN_NAME + ".applypresetdirectly";
 
     protected Logger log = LogManager.getLogger(AreaSelectorAction.class.getCanonicalName());
 
@@ -94,9 +103,12 @@ public class AreaSelectorAction extends MapMode implements MouseListener {
     protected void readPrefs() {
         this.mergeNodes = new BooleanProperty(KEY_MERGENODES, true).get();
         this.showAddressDialog = new BooleanProperty(KEY_SHOWADDRESSDIALOG, true).get();
+        this.taggingStyle = new StringProperty(KEY_TAGGINGSTYLE, "none").get();
+        this.taggingPresetName = new StringProperty(KEY_TAGGINGPRESETNAME, "").get();
         useAustriaAdressHelper = new BooleanProperty(KEY_AAH, false).get();
         replaceBuildings = new BooleanProperty(KEY_REPLACEBUILDINGS, true).get();
         addSourceTag = new BooleanProperty(KEY_ADDSOURCETAG, false).get();
+        applyPresetDirectly = new BooleanProperty(KEY_APPLYPRESETDIRECTLY, false).get();
     }
 
     private static Cursor getCursor() {
@@ -179,7 +191,7 @@ public class AreaSelectorAction extends MapMode implements MouseListener {
     }
 
     public void createArea() {
-
+        ////////// Polygon generation
         MapView mapView = MainApplication.getMap().mapView;
 
         BufferedImage bufImage = getLayeredImage();
@@ -196,66 +208,137 @@ public class AreaSelectorAction extends MapMode implements MouseListener {
         imgAnalyzer.setToleranceDist(toleranceInPixel);
 
         Polygon polygon = imgAnalyzer.getArea();
+        if (polygon == null) {
+            JOptionPane.showMessageDialog(MainApplication.getMap(), tr("Unable to detect a polygon where you clicked."),
+                tr("Area Selector"), JOptionPane.WARNING_MESSAGE);
+            return;
+        }
 
-        if (polygon != null) {
+        Way way = createWayFromPolygon(mapView, polygon), newWay = null;
+
+        DataSet ds = MainApplication.getLayerManager().getEditDataSet();
+        Collection<Command> cmds = new LinkedList<>();
+        List<Node> nodes = way.getNodes();
+        for (int i = 0; i < nodes.size() - 1; i++) {
+            cmds.add(new AddCommand(ds, nodes.get(i)));
+        }
+        cmds.add(new AddCommand(ds, way));
+        UndoRedoHandler.getInstance().add(new SequenceCommand(/* I18n: Name of command */ tr("create building"), cmds));
+
+        if (replaceBuildings) {
             Way existingWay = MainApplication.getMap().mapView.getNearestWay(clickPoint, OsmPrimitive::isUsable);
+            if (existingWay != null && way.getBBox().bounds(existingWay.getBBox().getCenter())) {
+                log.info("existing way is inside of new building: " + existingWay.toString() + " is in " + way.toString());
+                UndoRedoHandler.getInstance().add(new SequenceCommand(tr("replace building"), replaceWay(existingWay, way)));
+                way = existingWay;
+            }
+        }
 
-            Way way = createWayFromPolygon(mapView, polygon), newWay = null;
+        ds.setSelected(way);
 
+        if (mergeNodes) {
+            mergeNodes(way);
+        }
+
+        if (useAustriaAdressHelper) {
+            Map<String, String> newAddress = fetchAddress(way);
+            if (newAddress != null) {
+                newWay = new Way(way);
+                newWay.setKeys(newAddress);
+                log.info("Found attributes: {}", newWay.getKeys());
+                if (!showAddressDialog) {
+                    final List<Command> commands = new ArrayList<>();
+                    commands.add(new ChangeCommand(way, newWay));
+                    UndoRedoHandler.getInstance().add(
+                            new SequenceCommand(trn("Add address", "Add addresses", commands.size()), commands));
+                }
+            }
+        }
+
+        if (!showAddressDialog && addSourceTag) {
+            // TODO: why check for showAddressDialog?
+            ArrayList<String> sources = new ArrayList<>();
+            for (Layer layer : mapView.getLayerManager().getVisibleLayersInZOrder()) {
+                if (layer.isVisible() && layer.isBackgroundLayer()) {
+                    sources.add(layer.getName());
+                }
+            }
+            Collections.reverse(sources);
+            String source = sources.stream().map(Object::toString).collect(Collectors.joining("; ")).toString();
+            if (!source.isEmpty()) {
+                way.put(AddressDialog.TAG_SOURCE, source);
+            }
+        }
+
+        ////////// Tagging
+        // TODO: upgrade to enum or constants
+        if (taggingStyle.equals("none")) {
+            // Do nothing
+        } else if (taggingStyle.equals("presetSearchDialog")) {
+            if (getLayerManager().getActiveData() == null) {
+                JOptionPane.showMessageDialog(
+                    MainApplication.getMap(),
+                    tr("There is no active data layer, cannot show preset search dialog."),
+                    tr("Area Selector"),
+                    JOptionPane.WARNING_MESSAGE
+                );
+                return;
+            }
+            TaggingPresetSearchDialog.getInstance().showDialog();
+        } else if (taggingStyle.equals("specificPreset")) {
+            // TODO custom preset support, hook into that plugin?
+
+            if (taggingPresetName.isEmpty()) {
+                JOptionPane.showMessageDialog(
+                    MainApplication.getMap(),
+                    tr("No preset name configured in the settings, enter one."),
+                    tr("Area Selector"),
+                    JOptionPane.WARNING_MESSAGE
+                );
+                return;
+            }
+
+            // Find the configured preset
+            TaggingPreset taggingPresetToApply = null;
+            for (TaggingPreset taggingPreset : TaggingPresets.getTaggingPresets()) {
+                if (taggingPreset.getRawName().equals(taggingPresetName)) {
+                    taggingPresetToApply = taggingPreset;
+                    break;
+                }
+            }
+            if (taggingPresetToApply == null) {
+                JOptionPane.showMessageDialog(
+                    MainApplication.getMap(),
+                    tr("Could not find configured tagging preset: '{0}'.", taggingPresetName),
+                    tr("Area Selector"),
+                    JOptionPane.WARNING_MESSAGE
+                );
+                return;
+            }
+
+            // Check that tagging preset can be applied to closed ways
+            if (!taggingPresetToApply.types.contains(TaggingPresetType.CLOSEDWAY)) {
+                JOptionPane.showMessageDialog(
+                    MainApplication.getMap(),
+                    tr("Selected preset is not suitable for a closed way, select another one: '{0}'.", taggingPresetName),
+                    tr("Area Selector"),
+                    JOptionPane.WARNING_MESSAGE
+                );
+                return;
+            }
+
+            if (applyPresetDirectly) {
+                // Directly apply the tags of the configured preset
+                Command cmd = TaggingPreset.createCommand(Collections.singleton(way), taggingPresetToApply.getChangedTags());
+                if (cmd != null) {
+                    UndoRedoHandler.getInstance().add(cmd);
+                }
+            } else {
+                // Show the dialog of the configured preset
+                taggingPresetToApply.showAndApply(Collections.singleton(way));
+            }
+        } else if (taggingStyle.equals("address")) {
             way.put(AddressDialog.TAG_BUILDING, new StringProperty(AddressDialog.PREF_BUILDING, "yes").get());
-
-            if (!showAddressDialog && addSourceTag) {
-                ArrayList<String> sources = new ArrayList<>();
-                for (Layer layer : mapView.getLayerManager().getVisibleLayersInZOrder()) {
-                    if (layer.isVisible() && layer.isBackgroundLayer()) {
-                        sources.add(layer.getName());
-                    }
-                }
-                Collections.reverse(sources);
-                String source = sources.stream().map(Object::toString).collect(Collectors.joining("; ")).toString();
-                if (!source.isEmpty()) {
-                    way.put(AddressDialog.TAG_SOURCE, source);
-                }
-            }
-
-            DataSet ds = MainApplication.getLayerManager().getEditDataSet();
-            Collection<Command> cmds = new LinkedList<>();
-            List<Node> nodes = way.getNodes();
-            for (int i = 0; i < nodes.size() - 1; i++) {
-                cmds.add(new AddCommand(ds, nodes.get(i)));
-            }
-            cmds.add(new AddCommand(ds, way));
-            UndoRedoHandler.getInstance().add(new SequenceCommand(/* I18n: Name of command */ tr("create building"), cmds));
-
-            if (replaceBuildings && existingWay != null) {
-                if (way.getBBox().bounds(existingWay.getBBox().getCenter())) {
-                    log.info("existing way is inside of new building: "+existingWay.toString() + " is in " + way.toString());
-                    UndoRedoHandler.getInstance().add(new SequenceCommand(tr("replace building"), replaceWay(existingWay, way)));
-                    way = existingWay;
-                }
-            }
-
-            ds.setSelected(way);
-
-            if (mergeNodes) {
-                mergeNodes(way);
-            }
-
-            if (useAustriaAdressHelper) {
-                Map<String, String> newAddress = fetchAddress(way);
-                if (newAddress != null) {
-                    newWay = new Way(way);
-                    newWay.setKeys(newAddress);
-                    log.info("Found attributes: {}", newWay.getKeys());
-                    if (!showAddressDialog) {
-                        final List<Command> commands = new ArrayList<>();
-                        commands.add(new ChangeCommand(way, newWay));
-                        UndoRedoHandler.getInstance().add(
-                                new SequenceCommand(trn("Add address", "Add addresses", commands.size()), commands));
-                    }
-                }
-            }
-
             if (showAddressDialog) {
                 if (newWay == null) {
                     newWay = way;
@@ -263,8 +346,12 @@ public class AreaSelectorAction extends MapMode implements MouseListener {
                 new AddressDialog(newWay, way).showAndSave();
             }
         } else {
-            JOptionPane.showMessageDialog(MainApplication.getMap(), tr("Unable to detect a polygon where you clicked."),
-                    tr("Area Selector"), JOptionPane.WARNING_MESSAGE);
+            JOptionPane.showMessageDialog(
+                MainApplication.getMap(),
+                tr("Unknown tagging style setting: '{0}'.", taggingStyle),
+                tr("Area Selector"),
+                JOptionPane.WARNING_MESSAGE
+            );
         }
     }
 
@@ -399,10 +486,6 @@ public class AreaSelectorAction extends MapMode implements MouseListener {
         return MergeNodesAction.mergeNodes(selectedNodes, targetNode, targetLocationNode);
     }
 
-    /**
-     * @param prefs
-     *            the prefs to set
-     */
     public void setPrefs() {
         this.readPrefs();
     }
